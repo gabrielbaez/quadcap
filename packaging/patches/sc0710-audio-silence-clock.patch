@@ -1,0 +1,204 @@
+Subject: [TEST PATCH 2/2] Clock silence delivery across HDMI signal loss
+
+Account for elapsed monotonic time instead of assuming delayed work runs
+exactly every 10 ms. Use the input lock hint to bypass the live-signal DMA
+jitter grace period after HDMI loss. Bound catch-up to half the ALSA ring
+and 100 ms so a delayed worker cannot lap the capture buffer.
+
+This GPL-2.0-or-later driver patch follows sc0710-audio-lifecycle.patch
+against the driver pin
+ea0a71215e24a33aa8b26b5cc66e3592c9dfdfe1.
+It is experimental and has not been submitted upstream. Audible PS5
+shutdown behaviour and video recovery still need hardware verification.
+
+---
+
+diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
+--- a/lib/sc0710-audio.c
++++ b/lib/sc0710-audio.c
+@@ -21,6 +21,7 @@
+ 
+ #include <linux/vmalloc.h>
+ #include <linux/workqueue.h>
++#include <linux/math64.h>
+ #include "sc0710.h"
+ 
+ static unsigned int audio_debug = 0;
+@@ -29,7 +30,7 @@
+ 
+ #define SC0710_AUDIO_RATE_HZ        48000
+ #define SC0710_AUDIO_SILENCE_MS       10
+-#define SC0710_AUDIO_SILENCE_SAMPLES  ((SC0710_AUDIO_RATE_HZ * SC0710_AUDIO_SILENCE_MS) / 1000)
++#define SC0710_AUDIO_MAX_SILENCE_FRAMES (SC0710_AUDIO_RATE_HZ / 10)
+ /* Real-delivery pause before the watchdog starts feeding silence; must sit
+  * well above normal DMA completion jitter (single-digit ms). */
+ #define SC0710_AUDIO_GAP_MS           100
+@@ -96,24 +97,62 @@
+ 		snd_pcm_period_elapsed(substream);
+ }
+ 
+-/* Delivery-gap watchdog, armed for the whole capture session. The DMA
+- * path stops delivering samples on signal loss, across a resolution
+- * switch's DMA stop/restart, and while HDMI audio renegotiates after a
+- * mode change; a capture stream that makes no progress for 10 s is
+- * killed by the ALSA core (read returns -EIO) and takes the app's audio
+- * with it. Whenever real samples pause for longer than the gap
+- * threshold this feeds silence in their place, so the stream survives
+- * and real audio resumes seamlessly.
+- * Runs in a kworker (process context), so it may take the sleeping
+- * ch->lock -- unlike a timer callback (softirq), which caused a
+- * "scheduling while atomic" panic on signal loss. */
++/* The channel mutex serializes this clock with real DMA delivery. The
++ * capture lock also excludes START/STOP and prepare, which ALSA may invoke
++ * independently of video. A late worker must account for elapsed time,
++ * rather than losing samples on every delayed wakeup.
++ */
++static unsigned int sc0710_audio_silence_due(struct sc0710_audio_dev *chip,
++					  u64 now, bool signal_present)
++{
++	struct snd_pcm_substream *substream;
++	u64 elapsed, frames, pending, limit;
++	unsigned long flags;
++	unsigned int due = 0;
++
++	spin_lock_irqsave(&chip->capture_lock, flags);
++	substream = chip->substream;
++	if (!chip->running || !substream || !substream->runtime ||
++	    now < chip->last_sample_ns)
++		goto unlock;
++
++	elapsed = now - chip->last_sample_ns;
++	/* Retain the DMA jitter allowance only while HDMI still has a signal. */
++	if (signal_present && elapsed < SC0710_AUDIO_GAP_MS * NSEC_PER_MSEC)
++		goto unlock;
++
++	frames = mul_u64_u32_div(elapsed, SC0710_AUDIO_RATE_HZ, NSEC_PER_SEC);
++	if (frames <= chip->silence_frames)
++		goto unlock;
++
++	pending = frames - chip->silence_frames;
++	limit = min_t(u64, substream->runtime->buffer_size / 2,
++		      SC0710_AUDIO_MAX_SILENCE_FRAMES);
++	if (!limit)
++		goto unlock;
++	/* A delayed worker must not lap the ring and expose stale samples.
++	 * Discard excess backlog but keep the current clock phase.
++	 */
++	due = min_t(u64, pending, limit);
++	chip->silence_frames = frames;
++
++unlock:
++	spin_unlock_irqrestore(&chip->capture_lock, flags);
++	return due;
++}
++
++/* Keep an open PCM moving across HDMI loss without sleeping under ALSA's
++ * stream lock. Signal flags are hints only: real samples reset the clock
++ * under the same channel mutex, so an input that resumes wins immediately.
++ */
+ static void sc0710_audio_silence_work_fn(struct work_struct *work)
+ {
+ 	struct sc0710_audio_dev *chip =
+ 		container_of(work, struct sc0710_audio_dev, silence_work.work);
+ 	struct sc0710_dev *dev = chip->dev;
+ 	struct sc0710_dma_channel *ch = &dev->channel[1];
+-	unsigned long deadline, now, next;
++	bool signal_present;
++	unsigned int frames;
+ 
+ 	mutex_lock(&ch->lock);
+ 	if (!READ_ONCE(chip->running) || !chip->substream) {
+@@ -121,27 +160,19 @@
+ 		return;
+ 	}
+ 
+-	/* One jiffies sample for both the check and the sleep length: a
+-	 * re-read racing past the deadline would wrap the subtraction. */
+-	now = jiffies;
+-	deadline = READ_ONCE(chip->last_sample_jiffies) + msecs_to_jiffies(SC0710_AUDIO_GAP_MS);
+-	if (time_after(now, deadline)) {
+-		if (audio_debug)
+-			printk_ratelimited(KERN_INFO "%s: audio delivery gap, feeding ALSA silence\n",
+-				dev->name);
+-		sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
+-		next = msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS);
+-	} else {
+-		/* Healthy delivery: sleep until the gap threshold after the
+-		 * most recent real samples, instead of ticking every period.
+-		 * Real deliveries move the deadline forward; this wake just
+-		 * re-checks it. */
+-		next = deadline - now + 1;
+-	}
+-
+-	/* re-check: running can be cleared via the ALSA trigger without ch->lock */
++	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
++		signal_present = READ_ONCE(dev->clp_input[chip->input].locked);
++	else
++		signal_present = READ_ONCE(dev->locked);
++
++	frames = sc0710_audio_silence_due(chip, ktime_get_ns(), signal_present);
++	if (frames)
++		sc0710_audio_push_frames(chip, frames, NULL, 0, true);
++
++	/* Check signal loss promptly even when the last delivery was healthy. */
+ 	if (READ_ONCE(chip->running) && chip->substream)
+-		mod_delayed_work(system_wq, &chip->silence_work, next);
++		mod_delayed_work(system_wq, &chip->silence_work,
++				 msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+ 
+ 	mutex_unlock(&ch->lock);
+ }
+@@ -253,6 +284,7 @@
+ 	struct sc0710_audio_dev *chip;
+ 	struct snd_pcm_substream *substream;
+ 	struct snd_pcm_runtime *runtime;
++	unsigned long flags;
+ 
+ 	if (channels != 2 || bitdepth != 16 || samplesPerChannel <= 0)
+ 		return -1;
+@@ -275,7 +307,10 @@
+ 		return -1;
+ 
+ 	sc0710_audio_push_frames(chip, samplesPerChannel, buf, strideBytes, false);
+-	WRITE_ONCE(chip->last_sample_jiffies, jiffies);
++	spin_lock_irqsave(&chip->capture_lock, flags);
++	chip->last_sample_ns = ktime_get_ns();
++	chip->silence_frames = 0;
++	spin_unlock_irqrestore(&chip->capture_lock, flags);
+ 
+ 	sc0710_things_per_second_update(&ch->audioSamplesPerSecond,
+ 					samplesPerChannel * 2);
+@@ -433,16 +468,14 @@
+ 
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+-		/* Baseline for the gap watchdog: with no signal at START the
+-		 * first silence fill lands one gap threshold later. Trigger
+-		 * runs under snd_pcm_stream_lock (atomic); mod_delayed_work
+-		 * is safe there. */
++		/* Start a fresh sample clock even when HDMI is already absent. */
+ 		spin_lock_irqsave(&chip->capture_lock, flags);
+-		WRITE_ONCE(chip->last_sample_jiffies, jiffies);
++		chip->last_sample_ns = ktime_get_ns();
++		chip->silence_frames = 0;
+ 		chip->running = true;
+ 		spin_unlock_irqrestore(&chip->capture_lock, flags);
+ 		mod_delayed_work(system_wq, &chip->silence_work,
+-				 msecs_to_jiffies(SC0710_AUDIO_GAP_MS));
++				 msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+ 		/* Cam Link Pro exposes four standalone audio inputs, so ALSA must
+ 		 * work without a matching V4L2 stream. Older cards retain their
+ 		 * opt-in keep_audio_alive policy. */
+diff --git a/lib/sc0710.h b/lib/sc0710.h
+--- a/lib/sc0710.h
++++ b/lib/sc0710.h
+@@ -585,7 +585,8 @@
+ 	bool                       running;
+ 	u8                         input; /* Cam Link Pro HDMI input 0..3 */
+ 	bool                       dma_held;
+-	unsigned long              last_sample_jiffies; /* Last real-sample delivery */
++	u64                        last_sample_ns;
++	u64                        silence_frames; /* Frames accounted since last real delivery */
+ 	struct delayed_work        silence_work;
+ 
+ 	/* keep_audio_alive only. The ALSA trigger callback runs under

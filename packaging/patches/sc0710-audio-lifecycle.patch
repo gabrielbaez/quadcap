@@ -1,0 +1,211 @@
+Subject: [TEST PATCH] Serialize sc0710 capture state and ring publication
+
+Video DMA can outlive an ALSA capture stream. Do not publish samples while
+capture is stopped, and serialize ring-pointer resets with the producer.
+Notify ALSA once per delivered batch after dropping the capture lock to
+preserve the stream-lock/capture-lock ordering used by trigger.
+
+This GPL-2.0-or-later driver patch is carried separately from quadcap's
+Apache-2.0 application. It targets sc0710 commit
+ea0a71215e24a33aa8b26b5cc66e3592c9dfdfe1. It has not been submitted
+upstream.
+Hardware verification of the reported crackling is still required.
+
+---
+
+diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
+--- a/lib/sc0710-audio.c
++++ b/lib/sc0710-audio.c
+@@ -43,21 +43,29 @@
+ 				     unsigned int samples, const u8 *src,
+ 				     unsigned int stride_bytes, bool silence)
+ {
+-	struct snd_pcm_substream *substream = chip->substream;
++	struct snd_pcm_substream *substream;
+ 	struct snd_pcm_runtime *runtime;
+ 	snd_pcm_uframes_t period_size;
++	unsigned long flags;
+ 	unsigned int i;
+-
++	bool elapsed = false;
++
++	/* Video DMA may keep delivering after ALSA stops or enters recovery. */
++	spin_lock_irqsave(&chip->capture_lock, flags);
++	if (!chip->running)
++		goto unlock;
++
++	substream = chip->substream;
+ 	if (!substream)
+-		return;
++		goto unlock;
+ 
+ 	runtime = substream->runtime;
+ 	if (!runtime || !runtime->dma_area || !runtime->buffer_size)
+-		return;
++		goto unlock;
+ 
+ 	period_size = runtime->period_size;
+ 	if (!period_size)
+-		return;
++		goto unlock;
+ 
+ 	for (i = 0; i < samples; i++) {
+ 		u32 *dst = (u32 *)(runtime->dma_area + chip->buffer_ptr * 4);
+@@ -73,10 +81,19 @@
+ 	}
+ 
+ 	chip->period_pos += samples;
+-	while (chip->period_pos >= period_size) {
+-		chip->period_pos -= period_size;
++	if (chip->period_pos >= period_size) {
++		chip->period_pos %= period_size;
++		elapsed = true;
++	}
++
++unlock:
++	spin_unlock_irqrestore(&chip->capture_lock, flags);
++	/* ALSA takes its stream lock here; trigger takes it before capture_lock.
++	 * One notification publishes the current pointer, even for a batch that
++	 * crossed multiple periods. The channel mutex keeps substream alive.
++	 */
++	if (elapsed)
+ 		snd_pcm_period_elapsed(substream);
+-	}
+ }
+ 
+ /* Delivery-gap watchdog, armed for the whole capture session. The DMA
+@@ -99,7 +116,7 @@
+ 	unsigned long deadline, now, next;
+ 
+ 	mutex_lock(&ch->lock);
+-	if (!chip->running || !chip->substream) {
++	if (!READ_ONCE(chip->running) || !chip->substream) {
+ 		mutex_unlock(&ch->lock);
+ 		return;
+ 	}
+@@ -107,7 +124,7 @@
+ 	/* One jiffies sample for both the check and the sleep length: a
+ 	 * re-read racing past the deadline would wrap the subtraction. */
+ 	now = jiffies;
+-	deadline = chip->last_sample_jiffies + msecs_to_jiffies(SC0710_AUDIO_GAP_MS);
++	deadline = READ_ONCE(chip->last_sample_jiffies) + msecs_to_jiffies(SC0710_AUDIO_GAP_MS);
+ 	if (time_after(now, deadline)) {
+ 		if (audio_debug)
+ 			printk_ratelimited(KERN_INFO "%s: audio delivery gap, feeding ALSA silence\n",
+@@ -123,7 +140,7 @@
+ 	}
+ 
+ 	/* re-check: running can be cleared via the ALSA trigger without ch->lock */
+-	if (chip->running && chip->substream)
++	if (READ_ONCE(chip->running) && chip->substream)
+ 		mod_delayed_work(system_wq, &chip->silence_work, next);
+ 
+ 	mutex_unlock(&ch->lock);
+@@ -258,7 +275,7 @@
+ 		return -1;
+ 
+ 	sc0710_audio_push_frames(chip, samplesPerChannel, buf, strideBytes, false);
+-	chip->last_sample_jiffies = jiffies;
++	WRITE_ONCE(chip->last_sample_jiffies, jiffies);
+ 
+ 	sc0710_things_per_second_update(&ch->audioSamplesPerSecond,
+ 					samplesPerChannel * 2);
+@@ -321,13 +338,16 @@
+ 	struct sc0710_audio_dev *chip = snd_pcm_substream_chip(substream);
+ 	struct sc0710_dev *dev = chip->dev;
+ 	struct sc0710_dma_channel *ch = &dev->channel[1];
++	unsigned long flags;
+ 
+ 	dprintk(1, "%s()\n", __func__);
+ 
+ 	/* Stop the hardware */
+ 	mutex_lock(&ch->lock);
++	spin_lock_irqsave(&chip->capture_lock, flags);
+ 	chip->running = false;
+ 	chip->substream = NULL;
++	spin_unlock_irqrestore(&chip->capture_lock, flags);
+ 	mutex_unlock(&ch->lock);
+ 
+ 	/* sync-cancel outside ch->lock (the work takes it); state cleared
+@@ -383,12 +403,15 @@
+ {
+ 	struct sc0710_audio_dev *chip = snd_pcm_substream_chip(substream);
+ 	struct sc0710_dev *dev = chip->dev;
+-	//struct sc0710_dma_channel *ch = &dev->channel[1];
++	unsigned long flags;
+ 
+ 	dprintk(1, "%s() requested rate = %d\n", __func__, substream->runtime->rate);
+ 
++	spin_lock_irqsave(&chip->capture_lock, flags);
++	chip->running = false;
+ 	chip->buffer_ptr = 0;
+ 	chip->period_pos = 0;
++	spin_unlock_irqrestore(&chip->capture_lock, flags);
+ 
+ 	if (substream->runtime->rate != 48000) {
+ 		dprintk(1, "%s() audio rate mismatch (%u vs %u)\n", __func__, substream->runtime->rate, 48000);
+@@ -404,6 +427,7 @@
+ {
+ 	struct sc0710_audio_dev *chip = snd_pcm_substream_chip(substream);
+ 	struct sc0710_dev *dev = chip->dev;
++	unsigned long flags;
+ 
+ 	dprintk(1, "%s() cmd %d\n", __func__, cmd);
+ 
+@@ -413,8 +437,10 @@
+ 		 * first silence fill lands one gap threshold later. Trigger
+ 		 * runs under snd_pcm_stream_lock (atomic); mod_delayed_work
+ 		 * is safe there. */
+-		chip->last_sample_jiffies = jiffies;
++		spin_lock_irqsave(&chip->capture_lock, flags);
++		WRITE_ONCE(chip->last_sample_jiffies, jiffies);
+ 		chip->running = true;
++		spin_unlock_irqrestore(&chip->capture_lock, flags);
+ 		mod_delayed_work(system_wq, &chip->silence_work,
+ 				 msecs_to_jiffies(SC0710_AUDIO_GAP_MS));
+ 		/* Cam Link Pro exposes four standalone audio inputs, so ALSA must
+@@ -429,7 +455,9 @@
+ 
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 		/* atomic context: async cancel only; pcm_close() does the sync teardown */
++		spin_lock_irqsave(&chip->capture_lock, flags);
+ 		chip->running = false;
++		spin_unlock_irqrestore(&chip->capture_lock, flags);
+ 		cancel_delayed_work(&chip->silence_work);
+ 		if (atomic_read(&chip->dma_want)) {
+ 			atomic_set(&chip->dma_want, 0);
+@@ -446,8 +474,13 @@
+ 						    *substream)
+ {
+ 	struct sc0710_audio_dev *chip = snd_pcm_substream_chip(substream);
+-	//printk("%s()\n", __func__);
+-	return chip->buffer_ptr;
++	snd_pcm_uframes_t pointer;
++	unsigned long flags;
++
++	spin_lock_irqsave(&chip->capture_lock, flags);
++	pointer = chip->buffer_ptr;
++	spin_unlock_irqrestore(&chip->capture_lock, flags);
++	return pointer;
+ }
+ 
+ static struct page *snd_pcm_pd_get_page(struct snd_pcm_substream *subs,
+@@ -560,6 +593,7 @@
+ 	chip = (struct sc0710_audio_dev *)card->private_data;
+ 	chip->card = card;
+ 	chip->dev = dev;
++	spin_lock_init(&chip->capture_lock);
+ 	chip->buffer_ptr = 0;
+ 	chip->running = false;
+ 	chip->input = input;
+diff --git a/lib/sc0710.h b/lib/sc0710.h
+--- a/lib/sc0710.h
++++ b/lib/sc0710.h
+@@ -579,6 +579,7 @@
+ 	struct sc0710_dev         *dev;
+ 	struct snd_pcm_substream  *substream;
+ 	struct  snd_card          *card;
++	spinlock_t                 capture_lock; /* ALSA state and ring publication */
+ 	snd_pcm_uframes_t          buffer_ptr;
+ 	snd_pcm_uframes_t          period_pos;
+ 	bool                       running;
