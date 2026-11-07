@@ -18,6 +18,43 @@ spec.loader.exec_module(profile)
 
 
 class AudioProfile(unittest.TestCase):
+    def setUp(self):
+        self.fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(self.fixture.cleanup)
+        self.mixer = Path(self.fixture.name)
+        (self.mixer / 'paths').mkdir()
+        (self.mixer / 'profile-sets').mkdir()
+        (self.mixer / 'paths/analog-input-linein.conf').write_text(
+            '[General]\npriority = 81\n'
+            '[Element Capture]\nswitch = mute\nvolume = merge\n'
+            '[Element Line Boost]\nvolume = merge\n'
+            '[Element Line]\nvolume = merge\n'
+            '[Element Rear Mic]\nvolume = off\n')
+        (self.mixer / 'profile-sets/default.conf').write_text(
+            '[Mapping analog-stereo]\npaths-input = analog-input-linein analog-input-mic\n'
+            'paths-output = analog-output-lineout analog-output-headphones\n')
+        override = patch.object(profile, 'find_mixer_root', return_value=self.mixer)
+        override.start()
+        self.addCleanup(override.stop)
+
+    def test_only_line_input_gain_is_fixed_at_unity(self):
+        result = profile.neutral_profile_files(self.mixer)
+        path = result[Path('alsa-card-profile/mixer/paths/quadcap-alc1220-linein.conf')].decode()
+        self.assertEqual(path.count('volume = zero'), 3)
+        self.assertIn('[Element Rear Mic]\nvolume = off', path)
+        self.assertIn('switch = mute', path)
+        mapping = result[Path('alsa-card-profile/mixer/profile-sets/quadcap-alc1220.conf')].decode()
+        self.assertIn('paths-input = quadcap-alc1220-linein analog-input-mic', mapping)
+        self.assertIn('paths-output = analog-output-lineout analog-output-headphones', mapping)
+
+    def test_unknown_profile_layout_fails_before_any_installation(self):
+        (self.mixer / 'paths/analog-input-linein.conf').write_text('[General]\n')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(RuntimeError):
+                profile.install_profile(root / 'config', root / 'state')
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_install_preserves_other_configuration_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -25,7 +62,7 @@ class AudioProfile(unittest.TestCase):
             other = config / 'pipewire/pipewire.conf.d/other.conf'
             other.parent.mkdir(parents=True)
             other.write_text('untouched')
-            self.assertEqual(len(profile.install_profile(config, state)), 4)
+            self.assertEqual(len(profile.install_profile(config, state)), 7)
             self.assertEqual(profile.install_profile(config, state), [])
             self.assertEqual(other.read_text(), 'untouched')
             self.assertFalse(state.exists())

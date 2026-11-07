@@ -21,7 +21,10 @@ cd quadcap
 python3 packaging/configure-capture-audio.py --apply-alsa
 ```
 
-The script installs four user configuration files and sets the detected Realtek
+The script installs five PipeWire/WirePlumber drop-ins plus two derived ALSA
+profile files. The ALC1220 line-input path holds Capture, Line Boost and Line
+controls at 0 dB, so volume requests use software gain instead of boosting the
+analog preamps. `--apply-alsa` also immediately sets the detected Realtek
 ALC1220 Line Boost and Capture controls to 0 dB. It uses sudo only to save ALSA
 state. It refuses ambiguous or missing codecs and does not assume a fixed ALSA
 card number. If this machine has no ALC1220, omit `--apply-alsa` and configure
@@ -44,7 +47,11 @@ systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.ser
 This installs a default/minimum quantum of 1024 frames, 2048 frames of MK.2
 capture headroom, the RODECaster playback scheduling workaround, and a higher
 RODECaster System driver priority. The Elgato rule matches driver/card identity
-rather than a PCI address. The added buffering trades latency for stability;
+rather than a PCI address. A device rule selects the neutral input path for the tested AMD Ryzen controller
+(PCI vendor/product 1022:15e3). Other capture paths and output mappings remain
+from the distribution profile. This hardware-specific profile is intended for
+this ALC1220 setup; inspect compatibility before using it on different hardware.
+The added buffering trades latency for stability;
 it is a reproducible device profile, not proof of a repaired kernel defect.
 
 For OBS video recovery, follow [the helper instructions](packaging/obs/README.md)
@@ -66,7 +73,11 @@ cat /proc/sc0710-state
 The successful session used a temporary runtime `clock.force-quantum=1024` and
 runtime Elgato headroom=2048. The persistent profile enforces a 1024 minimum so
 normal clients cannot shrink it back to 256, while allowing larger requests.
-It still needs a restart test to confirm the whole persistent configuration.
+A stock-driver restart test on 2026-11-06 confirmed the minimum quantum and
+headroom load from the persistent files without a forced runtime quantum.
+The neutral-input profile also survived two WirePlumber restarts and software
+volume changes from 50% to 100%, with both hardware gains staying at 0 dB.
+A fresh boot and a full stock-driver HDMI off/on test are still pending.
 
 ## Experimental driver: separate validation
 
@@ -90,3 +101,24 @@ source services video and audio in one DMA thread, video first, so video work
 is a plausible source of jitter, not an established cause. Regressions must
 cover signal loss, restoration, 4K capture, OBS recording, and other supported
 cards. The OBS geometry problem is distinct from these audio measurements.
+
+## Why saving ALSA state alone was insufficient
+
+The default `analog-input-linein` mixer path merges Capture and Line Boost into
+its volume control. On the test machine, the gains returned to +30 dB after an
+audio restart. Merely setting and storing them once did not prevent later
+volume handling from reapplying boost. With the neutral path, both hardware
+controls stay at 0 dB while software volume remains adjustable.
+
+The installer derives the path from the distribution's installed profile,
+changes only the three line-input gain policies from `merge` to `zero`, and
+references it from a copy of the stock profile set. It does not edit packaged
+system files or replace the Ryzen output path. The profile files live under
+`~/.config/alsa-card-profile/mixer/`. Unknown source layouts fail validation
+before installation. Regenerate the profile by rerunning the setup command
+following a major ALSA card-profile package change, then verify input/output.
+
+For rollback of this input quirk, remove
+`~/.config/wireplumber/wireplumber.conf.d/55-alc1220-neutral-line-input.conf`
+and restart WirePlumber. Existing installer backups retain any overwritten
+configuration. The generated ALSA files are unused without the device rule.
