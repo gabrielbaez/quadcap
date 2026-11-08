@@ -172,3 +172,22 @@ distinct DKMS/module version. Cam Link Pro also requires `CAMLINKPRO.FWI.HEX`
 extracted from the official Elgato installer with upstream's checksum validation.
 After reload verify the MK.2 logs interrupt-driven MSI service, Cam Link Pro
 binds with its own polling service, both captures work, and HDMI off/on recovers.
+
+### First IRQ-isolation hardware test (2026-11-07)
+
+Loaded `2026.09.02.2-irqfix` through DKMS with only upstream PR #89 and the
+IRQ-isolation patch. Cam Link firmware programmed successfully and all four
+HDMI inputs appeared; no HDMI sources were connected to those ports, so actual
+Cam Link capture remains untested. The MK.2 reported MSI IRQ 247 and, after
+reopening OBS at 3840x2160p60 YUYV, 3617 delivered / 0 missed interrupts.
+A 20-second user-space pointer sample showed median/p95/max delivery intervals
+of 16.85/33.90/35.07 ms versus 17.62/35.55/48.51 ms before the change (25-second
+sample). These short, differently timed samples are observational, not proof
+of causality or long-term audio stability. No new PipeWire errors appeared in
+the initial post-capture window.
+
+Enabling Cam Link changed the MK.2 video index from `/dev/video0` to
+`/dev/video6`. OBS's existing source was backed up and changed to the stable
+`/dev/v4l/by-path/pci-0000:0a:00.0-video-index0` path; OBS confirmed capture
+from that path at 4K60. ALSA card numbers changed too; applications should use
+stable node/device identities rather than numeric card indexes.
