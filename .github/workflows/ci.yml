@@ -33,6 +33,8 @@ jobs:
           python3 tests/driver/upstream_silence_timing.py driver-check
       - name: Verify optional experimental patch stack
         run: |
+          patch --batch --fuzz=0 --forward -d driver-check -p1 < packaging/patches/sc0710-per-device-irq.patch
+          python3 tests/driver/irq_policy.py driver-check
           patch --batch --fuzz=0 --forward -d driver-check -p1 < packaging/patches/sc0710-audio-lifecycle.patch
           patch --batch --fuzz=0 --forward -d driver-check -p1 < packaging/patches/sc0710-audio-silence-clock.patch
           python3 tests/driver/audio_lifecycle.py driver-check

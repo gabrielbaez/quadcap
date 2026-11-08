@@ -148,3 +148,27 @@ For rollback of this input quirk, remove
 `~/.config/wireplumber/wireplumber.conf.d/55-alc1220-neutral-line-input.conf`
 and restart WirePlumber. Existing installer backups retain any overwritten
 configuration. The generated ALSA files are unused without the device rule.
+
+## Mixed Cam Link Pro / MK.2 interrupt policy
+
+`packaging/patches/sc0710-per-device-irq.patch` fixes a separate multi-card
+probe bug in the pinned driver. Cam Link Pro requires polling, but its probe
+writes the global `irq_service=0`, disabling MSI for cards probed afterward.
+This happens even if Cam Link firmware loading then fails. The patch keeps
+the policy local to that probe. Explicit polling and MSI failure fallback
+are preserved. `tests/driver/irq_policy.py` compiles the actual policy block;
+it fails on the pin and passes with the patch. The experimental build helper
+includes this independent patch before the two audio experiment patches.
+
+On Gabriel's machine a 30-second function trace with 4K60 capture showed
+video dequeue up to 19.8 ms, a full DMA service pass up to 30.5 ms, and real
+audio delivery intervals up to 47.0 ms. This establishes uneven delivery,
+not that interrupt isolation alone resolves the audible stutter. The per-sample
+ring update and shared video/audio service still merit separate investigation.
+
+For the targeted hardware test, use the PR #89 pin plus only the per-device
+IRQ patch; do not include the two experimental audio patches. Install as a
+distinct DKMS/module version. Cam Link Pro also requires `CAMLINKPRO.FWI.HEX`
+extracted from the official Elgato installer with upstream's checksum validation.
+After reload verify the MK.2 logs interrupt-driven MSI service, Cam Link Pro
+binds with its own polling service, both captures work, and HDMI off/on recovers.

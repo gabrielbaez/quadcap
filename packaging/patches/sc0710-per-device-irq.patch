@@ -1,0 +1,22 @@
+Subject: [BACKPORT] Keep Cam Link polling policy local to that device
+
+The Cam Link Pro probe must not write the global irq_service parameter.
+Otherwise later MK.2/4K Pro probes lose MSI even if the Cam Link probe
+fails loading firmware. Preserve explicit irq_service=0 and MSI fallback.
+GPL-2.0-or-later; based on sc0710 PR #89 pin 5564ede7fb88.
+
+diff --git a/lib/sc0710-core.c b/lib/sc0710-core.c
+index 8ed8210..7ab75c8 100644
+--- a/lib/sc0710-core.c
++++ b/lib/sc0710-core.c
+@@ -1035,9 +1035,7 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
+ 		 * the small-descriptor conveyor redesign lands. */
+ 		printk(KERN_INFO "%s: Cam Link Pro: using polling DMA service\n",
+ 			dev->name);
+-		irq_service = 0;
+-	}
+-	if (irq_service) {
++	} else if (irq_service) {
+ 		if (pci_alloc_irq_vectors(pci_dev, 1, 1, PCI_IRQ_MSI) == 1 &&
+ 		    pci_request_irq(pci_dev, 0, sc0710_irq, NULL, dev,
+ 				    "%s", dev->name) == 0) {

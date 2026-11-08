@@ -6,6 +6,7 @@ project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 driver_source="${1:-${project_dir}/third_party/sc0710}"
 build_dir="${project_dir}/build/driver-audio-test"
 patch_files=(
+    "${project_dir}/packaging/patches/sc0710-per-device-irq.patch"
     "${project_dir}/packaging/patches/sc0710-audio-lifecycle.patch"
     "${project_dir}/packaging/patches/sc0710-audio-silence-clock.patch"
 )
@@ -40,6 +41,7 @@ for patch_file in "${patch_files[@]}"; do
     patch --batch --fuzz=0 --forward --silent -d "${stage}" -p1 < "${patch_file}"
 done
 
+python3 "${project_dir}/tests/driver/irq_policy.py" "${stage}"
 python3 "${project_dir}/tests/driver/audio_lifecycle.py" "${stage}"
 python3 "${project_dir}/tests/driver/silence_timing.py" "${stage}"
 printf '%s-audiofix2\n' "$(tr -d '[:space:]' < "${stage}/version")" > "${stage}/version"

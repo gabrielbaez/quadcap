@@ -2,7 +2,9 @@
 
 The application and its out-of-tree GPL driver are separate projects.
 The pin includes upstream PR #89; `upstream_silence_timing.py` exercises its
-clock pacing independently of the optional patches. The patches in
+clock pacing independently of the optional patches. The independent `sc0710-per-device-irq.patch` prevents Cam Link probe policy
+from disabling MSI on another card; `irq_policy.py` verifies mixed-card ordering.
+The audio experiment patches in
 `packaging/patches/sc0710-audio-lifecycle.patch` and
 `packaging/patches/sc0710-audio-silence-clock.patch` target the driver commit pinned
 by `third_party/sc0710.pin`. They are explicit test patches, not installer updates.
