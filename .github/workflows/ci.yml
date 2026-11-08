@@ -17,6 +17,27 @@ env:
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
+  driver-timing:
+    name: Pinned driver timing regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Fetch and verify pinned driver
+        run: |
+          pin="$(tr -d '[:space:]' <third_party/sc0710.pin)"
+          git clone --filter=blob:none https://github.com/Nakildias/sc0710.git driver-check
+          git -C driver-check checkout --detach "${pin}"
+          python3 tests/driver/upstream_silence_timing.py driver-check
+      - name: Verify optional experimental patch stack
+        run: |
+          patch --batch --fuzz=0 --forward -d driver-check -p1 < packaging/patches/sc0710-audio-lifecycle.patch
+          patch --batch --fuzz=0 --forward -d driver-check -p1 < packaging/patches/sc0710-audio-silence-clock.patch
+          python3 tests/driver/audio_lifecycle.py driver-check
+          python3 tests/driver/silence_timing.py driver-check
+
   quality:
     name: Quality gates
     runs-on: ubuntu-24.04

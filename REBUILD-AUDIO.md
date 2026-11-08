@@ -79,6 +79,32 @@ The neutral-input profile also survived two WirePlumber restarts and software
 volume changes from 50% to 100%, with both hardware gains staying at 0 dB.
 A fresh boot and a full stock-driver HDMI off/on test are still pending.
 
+## Upstream driver baseline
+
+The driver pin now includes [sc0710 PR #89](https://github.com/Nakildias/sc0710/pull/89)
+(commit `5564ede7fb888b1448c9d8f140e98a1cdc7f7485`). This merged fix paces
+silence by elapsed time during audio-delivery gaps, rather than emitting a fixed
+480 frames after each delayed 10 ms wake. It addresses clock drift during gaps;
+it does not establish a fix for jitter while HDMI audio is arriving normally.
+There were no open sc0710 pull requests when this update was prepared.
+
+GitHub's fork status compares quadcap with quadcap upstream; it does not compare
+this separately pinned driver with sc0710 upstream. The unchanged driver version
+string is also insufficient to identify whether PR #89 is present.
+
+Verify the upstream timing regression with a clean checkout at the driver pin:
+
+```bash
+python3 tests/driver/upstream_silence_timing.py third_party/sc0710
+```
+
+Updating this repository does not change the running kernel module. Existing
+`third_party/sc0710` source copies are not automatically refreshed by the installer,
+and an already-installed DKMS version is skipped. Refresh the source to the pin
+and plan a separate driver rebuild/reload after closing capture clients; do not
+assume rerunning the installer upgrades an existing module with the same version.
+The experimental patches below are rebased onto the new pin and remain opt-in.
+
 ## Experimental driver: separate validation
 
 The audiofix2 module is temporary and disappears at reboot. The installed DKMS

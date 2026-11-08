@@ -1,30 +1,26 @@
 Subject: [TEST PATCH 2/2] Clock silence delivery across HDMI signal loss
 
-Account for elapsed monotonic time instead of assuming delayed work runs
-exactly every 10 ms. Use the input lock hint to bypass the live-signal DMA
-jitter grace period after HDMI loss. Bound catch-up to half the ALSA ring
-and 100 ms so a delayed worker cannot lap the capture buffer.
-
-This GPL-2.0-or-later driver patch follows sc0710-audio-lifecycle.patch
-against the driver pin
-ea0a71215e24a33aa8b26b5cc66e3592c9dfdfe1.
-It is experimental and has not been submitted upstream. Audible PS5
-shutdown behaviour and video recovery still need hardware verification.
-
----
+Experimental alternative to upstream PR #89: also bypass the 100 ms grace
+period when HDMI is unlocked and bound catch-up to the capture ring.
+Applies after sc0710-audio-lifecycle.patch on the PR #89 driver pin.
+GPL-2.0-or-later; hardware validation required.
 
 diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
 --- a/lib/sc0710-audio.c
 +++ b/lib/sc0710-audio.c
-@@ -21,6 +21,7 @@
+@@ -19,10 +19,9 @@
+  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
  
+-#include <linux/ktime.h>
+-#include <linux/math64.h>
  #include <linux/vmalloc.h>
  #include <linux/workqueue.h>
 +#include <linux/math64.h>
  #include "sc0710.h"
  
  static unsigned int audio_debug = 0;
-@@ -29,7 +30,7 @@
+@@ -31,13 +30,10 @@
  
  #define SC0710_AUDIO_RATE_HZ        48000
  #define SC0710_AUDIO_SILENCE_MS       10
@@ -33,10 +29,56 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
  /* Real-delivery pause before the watchdog starts feeding silence; must sit
   * well above normal DMA completion jitter (single-digit ms). */
  #define SC0710_AUDIO_GAP_MS           100
-@@ -96,24 +97,62 @@
+-/* Most silence one wake may feed. A worker held up for longer restarts its
+- * clock instead of flooding the ring buffer to catch up. */
+-#define SC0710_AUDIO_SILENCE_MAX_BURST (SC0710_AUDIO_RATE_HZ / 20)
+ 
+ #define dprintk(level, fmt, arg...)\
+ 	do { if (audio_debug >= level)\
+@@ -101,64 +97,62 @@
  		snd_pcm_period_elapsed(substream);
  }
  
+-/* Frames of silence owed since the current gap began, paced by the clock
+- * rather than by the wake interval. Feeding a fixed 10 ms chunk per relative
+- * 10 ms sleep ran slow: each cycle also costs timer rounding and worker
+- * latency, so the 48 kHz stream advanced at about 42.4 kHz. A sound server
+- * that picks this device as its graph clock then starves every playback
+- * device in that graph whenever the HDMI signal is absent.
+- * Called from silence_work only. */
+-static unsigned int sc0710_audio_silence_owed(struct sc0710_audio_dev *chip)
+-{
+-	u64 now_ns = ktime_get_ns();
+-	u64 owed = 0;
+-
+-	if (chip->silence_active)
+-		owed = div_u64((now_ns - chip->silence_start_ns) *
+-			       SC0710_AUDIO_RATE_HZ, NSEC_PER_SEC);
+-
+-	/* New gap, or too far behind to catch up: start the clock one wake
+-	 * interval back, so this wake feeds one interval's worth. */
+-	if (!chip->silence_active || owed < chip->silence_frames ||
+-	    owed - chip->silence_frames > SC0710_AUDIO_SILENCE_MAX_BURST) {
+-		chip->silence_active = true;
+-		chip->silence_start_ns = now_ns -
+-			(u64)SC0710_AUDIO_SILENCE_MS * NSEC_PER_MSEC;
+-		chip->silence_frames = 0;
+-		owed = SC0710_AUDIO_SILENCE_SAMPLES;
+-	}
+-
+-	owed -= chip->silence_frames;
+-	chip->silence_frames += owed;
+-
+-	/* Rebase once a second's worth is fed; exact, and keeps the
+-	 * multiplication above far from overflow. */
+-	while (chip->silence_frames >= SC0710_AUDIO_RATE_HZ) {
+-		chip->silence_frames -= SC0710_AUDIO_RATE_HZ;
+-		chip->silence_start_ns += NSEC_PER_SEC;
+-	}
+-
+-	return (unsigned int)owed;
+-}
+-
 -/* Delivery-gap watchdog, armed for the whole capture session. The DMA
 - * path stops delivering samples on signal loss, across a resolution
 - * switch's DMA stop/restart, and while HDMI audio renegotiates after a
@@ -108,7 +150,7 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
  
  	mutex_lock(&ch->lock);
  	if (!READ_ONCE(chip->running) || !chip->substream) {
-@@ -121,27 +160,19 @@
+@@ -166,29 +160,19 @@
  		return;
  	}
  
@@ -120,9 +162,11 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
 -		if (audio_debug)
 -			printk_ratelimited(KERN_INFO "%s: audio delivery gap, feeding ALSA silence\n",
 -				dev->name);
--		sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
+-		sc0710_audio_push_frames(chip, sc0710_audio_silence_owed(chip),
+-					 NULL, 0, true);
 -		next = msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS);
 -	} else {
+-		chip->silence_active = false;
 -		/* Healthy delivery: sleep until the gap threshold after the
 -		 * most recent real samples, instead of ticking every period.
 -		 * Real deliveries move the deadline forward; this wake just
@@ -148,7 +192,7 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
  
  	mutex_unlock(&ch->lock);
  }
-@@ -253,6 +284,7 @@
+@@ -300,6 +284,7 @@
  	struct sc0710_audio_dev *chip;
  	struct snd_pcm_substream *substream;
  	struct snd_pcm_runtime *runtime;
@@ -156,7 +200,7 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
  
  	if (channels != 2 || bitdepth != 16 || samplesPerChannel <= 0)
  		return -1;
-@@ -275,7 +307,10 @@
+@@ -322,7 +307,10 @@
  		return -1;
  
  	sc0710_audio_push_frames(chip, samplesPerChannel, buf, strideBytes, false);
@@ -168,7 +212,7 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
  
  	sc0710_things_per_second_update(&ch->audioSamplesPerSecond,
  					samplesPerChannel * 2);
-@@ -433,16 +468,14 @@
+@@ -480,16 +468,14 @@
  
  	switch (cmd) {
  	case SNDRV_PCM_TRIGGER_START:
@@ -192,7 +236,7 @@ diff --git a/lib/sc0710-audio.c b/lib/sc0710-audio.c
 diff --git a/lib/sc0710.h b/lib/sc0710.h
 --- a/lib/sc0710.h
 +++ b/lib/sc0710.h
-@@ -585,7 +585,8 @@
+@@ -585,12 +585,9 @@
  	bool                       running;
  	u8                         input; /* Cam Link Pro HDMI input 0..3 */
  	bool                       dma_held;
@@ -200,5 +244,10 @@ diff --git a/lib/sc0710.h b/lib/sc0710.h
 +	u64                        last_sample_ns;
 +	u64                        silence_frames; /* Frames accounted since last real delivery */
  	struct delayed_work        silence_work;
+-	/* Silence pacing clock; touched only by silence_work. */
+-	bool                       silence_active;
+-	u64                        silence_start_ns;
+-	u64                        silence_frames; /* fed since silence_start_ns */
  
  	/* keep_audio_alive only. The ALSA trigger callback runs under
+ 	 * snd_pcm_stream_lock (atomic) but starting/stopping DMA needs
